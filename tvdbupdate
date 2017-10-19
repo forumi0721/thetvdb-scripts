@@ -1,0 +1,802 @@
+#!/bin/sh
+
+USERNAME=
+PASSWORD=
+COOKIE_FILE=cookie_file
+BASE_URL=https://www.thetvdb.com
+DEFAULT_CONFIG_FILE=series.json
+CONFIG_FILE=
+CONFIG_JSON=
+DATA_FILE=
+WORKDIR=.
+SIMULATION=Y
+
+DEBUG=N
+
+SERIES_ID=
+SERIES_LID=
+SERIES_INFO=
+SEASON_LIST=()
+
+echo_white() {
+	echo $'\e[01;0m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_gray() {
+	echo $'\e[01;30m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_red() {
+	echo $'\e[01;31m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_green() {
+	echo $'\e[01;32m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_yellow() {
+	echo $'\e[01;33m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_blue() {
+	echo $'\e[01;34m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_violet() {
+	echo $'\e[01;35m'"${1}"$'\e[0m'"${2}"
+}
+
+echo_cyan() {
+	echo $'\e[01;36m'"${1}"$'\e[0m'"${2}"
+}
+
+fn_usage() {
+	echo "$(basename "${0}") : -f [config json]"
+	exit 1
+}
+
+fn_urlencode() {
+	local input=${1}
+	local output=
+	if [ -z "${input}" ]; then
+		return
+	fi
+    output="$(curl -s -o /dev/null -w %{url_effective} --get --data-urlencode "${input}" "")"
+    if [[ $? != 3 ]]; then
+        echo "Unexpected error" 1>&2
+        return 2
+    fi
+    echo "${output##/?}"
+}
+
+fn_urldecode() {
+	local input=${1}
+	if [ -z "${input}" ]; then
+		return
+	fi
+    local url_encoded="${input//+/ }"
+    printf '%b' "${url_encoded//%/\\x}"
+}
+
+fn_debug() {
+	if [ "${DEBUG}" = "Y" ]; then
+		echo "$@"
+	fi
+}
+
+fn_login() {
+	if [ -e ${COOKIE_FILE} ]; then
+		if [ -z "$(curl -s -b ${COOKIE_FILE} ${BASE_URL} | grep "logout")" ]; then
+			rm -rf ${COOKIE_FILE}
+			echo_yellow " -> " "Cookie has expired"
+		fi
+	fi
+
+	if [ ! -e ${COOKIE_FILE} ]; then
+		echo_yellow " -> " "Get new login cookie"
+
+		curl -s -X POST -c ${COOKIE_FILE} -d "username=${USERNAME}" -d "password=${PASSWORD}" -d "setcookie=on" -d "function=Log In" -d "submit=Log In" "${BASE_URL}/?tab=login" > /dev/null
+	fi
+
+	if [ -z "$(curl -s -b ${COOKIE_FILE} ${BASE_URL} | grep "logout")" ]; then
+		echo_red " -> " "Error: Not Authorized"
+		exit 1
+	fi
+}
+
+fn_get_series_info() {
+	SEASON_LIST=()
+
+	#Logic
+	local season=
+	local url=
+	local name=
+
+	#시즌 정보 조회
+	while read -r season
+	do
+		url="$(echo "${season}" | sed -e 's/^<a href="\/?\(.*\)" class="seasonlink">\(.*\)<\/a>.*$/\1/g' | sed -e "s/\&amp;/\&/g")"
+		name="$(echo "${season}" | sed -e 's/^<a href="\/?\(.*\)" class="seasonlink">\(.*\)<\/a>.*$/\2/g' | sed -e "s/\&amp;/\&/g" | sed -e 's/Specials/0/g')"
+		if [ -z "${name}" -o "${name}" = "All" ]; then
+			continue
+		fi
+		SEASON_LIST+=("${name}:${url}")
+	done <<< "$(echo "${SERIES_INFO}" | grep 'tab=season' | sed -e 's/<a href=/\n<a href=/g')"
+
+	#누락된 시즌 추가
+	local inforefresh=N
+	for season in $(echo "${CONFIG_JSON}" | jq -r ".episodes[].season" | sort -u)
+	do
+		if [ -z "$(echo "${SEASON_LIST[@]}" | grep "\(^\| \)${season}:" )" ]; then
+			echo_yellow " -> " "Add new season (${season})"
+			if [ "${SIMULATION}" = "Y" ]; then
+				echo curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "Season=${season}" -d "function=Add Season" -s "https://www.thetvdb.com/index.php?tab=series&id=${SERIES_ID}"
+			else
+				curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "Season=${season}" -d "function=Add Season" -s "https://www.thetvdb.com/index.php?tab=series&id=${SERIES_ID}" > /dev/null
+			fi
+			inforefresh=Y
+		fi
+	done
+
+	#시즌 추가시 재조회
+	if [ "${inforefresh}" = "Y" ]; then
+		SERIES_INFO=
+		SEASON_LIST=()
+
+		SERIES_INFO="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=series" --data-urlencode "id=${SERIES_ID}" --data-urlencode "lid=${SERIES_LID}" -s "${BASE_URL}" | iconv -c)"
+
+		if [ -z "${SERIES_INFO}" ]; then
+			echo_red " -> " "Error: Cannot get series info"
+			exit 1
+		fi
+
+		local season=
+		local url=
+		local name=
+
+		#시즌 정보 조회
+		while read -r season
+		do
+			url="$(echo "${season}" | sed -e 's/^<a href="\/?\(.*\)" class="seasonlink">\(.*\)<\/a>.*$/\1/g' | sed -e "s/\&amp;/\&/g")"
+			name="$(echo "${season}" | sed -e 's/^<a href="\/?\(.*\)" class="seasonlink">\(.*\)<\/a>.*$/\2/g' | sed -e "s/\&amp;/\&/g" | sed -e 's/Specials/0/g')"
+			if [ -z "${name}" -o "${name}" = "All" ]; then
+				continue
+			fi
+			SEASON_LIST+=("${name}:${url}")
+		done <<< "$(echo "${SERIES_INFO}" | grep 'tab=season' | sed -e 's/<a href=/\n<a href=/g')"
+	fi
+
+	#DEBUG
+	if [ "${DEBUG}" = "Y" ]; then
+		echo_violet " -> " "Season List"
+		for season in ${SEASON_LIST[@]}
+		do
+			echo "${season}"
+		done
+		read -n 1 -s -r -p "Press any key to continue"
+		echo
+	fi
+
+	#Get Default Config
+	#SeriesName
+	for s in $(seq 1 1 32)
+	do
+		eval SERIES_SeriesName_${s}="$(fn_urlencode "$(echo "${SERIES_INFO}" | grep "<input type=\"text\".*name=\"SeriesName_${s}\".*>" | sed -e 's/^.*<input type="text".*name="\(SeriesName_[0-9]*\)".*value="\(.*\)" style=.*$/\2/g')")"
+	done
+
+	#Status
+	SERIES_Status="$(echo "${SERIES_INFO}" | grep -A 4 '<select name="Status"' | grep 'selected>' | sed -e 's/^.*<option value="\(.*\)" selected>.*$/\1/g')"
+
+	#Genre
+	SERIES_Genre="$(fn_urlencode "$(echo "${SERIES_INFO}" | grep '<input type="hidden" name="Genre"' | sed -e 's/^.*value="\([^"]*\)">.*$/\1/g')")"
+
+	#FirstAired
+	SERIES_FirstAired="$(echo "${SERIES_INFO}" | grep '<input type="text" name="FirstAired"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Airs_DayOfWeek
+	SERIES_Airs_DayOfWeek="$(echo "${SERIES_INFO}" | grep -A 11 '<select name="Airs_DayOfWeek"' | grep 'selected>' | sed -e 's/^.*<option selected>\(.*\)\s*$/\1/g')"
+
+	#Airs_Time
+	SERIES_Airs_Time="$(echo "${SERIES_INFO}" | grep '<input type="text" name="Airs_Time"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Network
+	SERIES_Network="$(echo "${SERIES_INFO}" | grep '<input type="hidden" name="Network"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Runtime
+	SERIES_Runtime="$(echo "${SERIES_INFO}" | grep -A 1 "<select name=\"Runtime\".*" | grep " selected>" | sed -e 's/^.*value=\([0-9]\+\) selected>.*$/\1/g')"
+
+	#Rating
+	SERIES_Rating="$(echo "${SERIES_INFO}" | grep -A 8 "<select name=\"Rating\"" | grep 'selected' | sed -e 's/^.*<option selected>\(.*\)\s*$/\1/g')"
+
+	#IMDB_ID
+	SERIES_IMDB_ID="$(echo "${SERIES_INFO}" | grep '<input type="text" name="IDMB_ID"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#zap2it_id
+	SERIES_zap2it_id="$(echo "${SERIES_INFO}" | grep '<input type="text" name="zap2it_id"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Overview
+	for s in $(seq 1 1 32)
+	do
+		local s_row="$(echo "${SERIES_INFO}" | grep -n "<textarea .*name=\"Overview_${s}\".*>" | cut -f 1 -d ':')"
+		if [ -z "${s_row}" ]; then
+			continue
+		fi
+		local e_row=
+		for r in $(echo "${SERIES_INFO}" | grep -n "</textarea>" | cut -f 1 -d ':')
+		do
+			if [ "${r}" -ge "${s_row}" ]; then
+				e_row=${r}
+				break
+			fi
+		done
+		local overview="$(echo "${SERIES_INFO}" | sed -n ${s_row},${e_row}p | sed -e 's/^.*<textarea .*name="Overview_[0-9]*"[^>]*>//g' -e 's/<\/textarea>//g')"
+		local overview_enc="$(fn_urlencode "${overview}")"
+		eval SERIES_Overview_${s}="\${overview_enc}"
+	done
+
+	SERIES_Graphical=($(echo "${SERIES_INFO}" | grep '<a href="banners/graphical.*>View Full Size' | sed -e "s@^.*<a href=\"\([^\"]*\)\" .*>.*\$@${BASE_URL}/\1@g"))
+	SERIES_Fanart=($(echo "${SERIES_INFO}" | grep '<a href="banners/fanart/original.*>View Full Size' | sed -e "s@^.*<a href=\"\([^\"]*\)\" .*>.*\$@${BASE_URL}/\1@g"))
+	SERIES_Poster=($(echo "${SERIES_INFO}" | grep '<a href="banners/poster.*>View Full Size' | sed -e "s@^.*<a href=\"\([^\"]*\)\" .*>.*\$@${BASE_URL}/\1@g"))
+
+	#Actor
+	SERIES_Actor=()
+	SERIES_ACTOR_INFO="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=actors" --data-urlencode "id=${SERIES_ID}" -s "${BASE_URL}" | iconv -c)"
+	for x in $(echo "${SERIES_ACTOR_INFO}" | grep -a -n '<div id="actor.*>' | grep -v '<div id="actorform.*>' | cut -f 1 -d ':')
+	do
+		local actor_id=
+		local actor_picture=
+		local actor_name=
+		local actor_role=
+		local actor_sort=
+
+		while read -r line
+		do
+			y="$(echo "${line}" | sed -e 's/^\([^:]\+\):.*$/\1/g')"
+			if [ "${y}" -ge "${x}" ]; then
+				actor_id="$(echo "${line}" | sed -e 's/^.*<div id="actor\([^"]\+\)" .*$/\1/g')"
+				break
+			fi
+		done <<< "$(echo "${SERIES_ACTOR_INFO}" | grep -a -n '<div id="actor.*>')"
+
+		if [ ! -z "${actor_id}" -a ! -z "$(echo "${SERIES_ACTOR_INFO}" | grep "/banners/_cache/actors/${actor_id}.jpg")" ]; then
+			actor_picture="https://www.thetvdb.com/banners/actors/${actor_id}.jpg"
+		fi
+
+		while read -r line
+		do
+			y="$(echo "${line}" | sed -e 's/^\([^:]\+\):.*$/\1/g')"
+			if [ "${y}" -ge "${x}" ]; then
+				actor_name="$(echo "${SERIES_ACTOR_INFO}" | sed -n ${y},$((y + 3))p | grep '<input type="input" name="Name"' | sed -e 's/^.*<input.*value="\([^"]\+\)".*$/\1/g')"
+				
+				break
+			fi
+		done <<< "$(echo "${SERIES_ACTOR_INFO}" | grep -a -n '<td>Actor Name:</td>')"
+
+		while read -r line
+		do
+			y="$(echo "${line}" | sed -e 's/^\([^:]\+\):.*$/\1/g')"
+			if [ "${y}" -ge "${x}" ]; then
+				actor_role="$(echo "${SERIES_ACTOR_INFO_ORG}" | sed -n ${y},$((y + 3))p | grep '<input type="input" name="Role"' | sed -e 's/^.*<input.*value="\([^"]\+\)".*$/\1/g')"
+				
+				break
+			fi
+		done <<< "$(echo "${SERIES_ACTOR_INFO_ORG}" | grep -a -n '<td>Role:</td>')"
+
+		while read -r line
+		do
+			y="$(echo "${line}" | sed -e 's/^\([^:]\+\):.*$/\1/g')"
+			if [ "${y}" -ge "${x}" ]; then
+				actor_sort="$(echo "${SERIES_ACTOR_INFO}" | sed -n ${y},$((y + 4))p | grep '<option value=".*" selected>' | sed -e 's/^.*<option value="\([^"]\+\)".*$/\1/g')"
+				
+				break
+			fi
+		done <<< "$(echo "${SERIES_ACTOR_INFO}" | grep -a -n '<select name="SortOrder"')"
+
+		SERIES_Actor+=("${actor_name}|${actor_role}|${actor_sort}|${actor_picture}")
+	done
+
+	if [ "${DEBUG}" = "Y" ]; then
+		local dump_file=dump_${SERIES_ID}.txt
+		rm -rf "${dump_file}"
+		echo_violet " -> " "Create dump file (${dump_file})"
+		for s in $(seq 1 1 32)
+		do
+			local seriesname="$(eval echo "\${SERIES_SeriesName_${s}}")"
+			local seriesoverview="$(eval echo "\${SERIES_Overview_${s}}")"
+
+			if [ ! -z "${seriesname}" ]; then
+				echo "SERIES_SeriesName_${s} = $(fn_urldecode "${seriesname}")" >> ${dump_file}
+			fi
+			if [ ! -z "${seriesoverview}" ]; then
+				echo "SERIES_Overview_${s} = $(fn_urldecode "${seriesoverview}")" >> ${dump_file}
+			fi
+		done
+		for x in SERIES_Status SERIES_Genre SERIES_FirstAired SERIES_Airs_DayOfWeek SERIES_Airs_Time SERIES_Network SERIES_Runtime SERIES_Rating SERIES_IMDB_ID SERIES_zap2it_id
+		do
+			local seriesvalue="$(eval echo "\${${x}}")"
+			if [ ! -z "${seriesvalue}" ]; then
+				echo "${x} = ${seriesvalue}" >> ${dump_file}
+			fi
+		done
+		echo_violet " -> " "Done."
+		read -n 1 -s -r -p "Press any key to continue"
+	fi
+}
+
+fn_update_series_info() {
+	local args=
+	local args2=
+
+	#SeriesName
+	for s in $(seq 1 1 32)
+	do
+		if [ "${s}" = "${SERIES_LID}" ]; then
+			SeriesName="$(echo "${CONFIG_JSON}" | jq -e -r .series.SeriesName)"
+			if [ $? -eq 0 ]; then
+				SeriesName="$(fn_urlencode "${SeriesName}")"
+				args+="SeriesName_${s}=${SeriesName}&"
+			else
+				args+="SeriesName_${s}=$(eval echo \${SERIES_SeriesName_${s}})&"
+			fi
+		else
+			args+="SeriesName_${s}=$(eval echo \${SERIES_SeriesName_${s}})&"
+		fi
+	done
+	#SeriesName은 업데이트가 불가능하여 비교 로직에서 제외
+	args2+="${args}"
+
+	#SeriesName_LangSelect
+	args+="SeriesName_LangSelect=${SERIES_LID}&"
+	args2+="SeriesName_LangSelect=${SERIES_LID}&"
+
+	#Overview
+	local s=
+	local Overview=
+	for s in $(seq 1 1 32)
+	do
+		if [ "${s}" = "${SERIES_LID}" ]; then
+			Overview="$(echo "${CONFIG_JSON}" | jq -e -r .series.Overview)"
+			if [ $? -eq 0 ]; then
+				args+="Overview_${s}=$(fn_urlencode "${Overview}")&"
+			else
+				args+="Overview_${s}=$(eval echo \${SERIES_Overview_${s}})&"
+			fi
+		else
+			args+="Overview_${s}=$(eval echo \${SERIES_Overview_${s}})&"
+		fi
+
+		local curr2="$(eval echo \${SERIES_Overview_${s}})"
+		args2+="Overview_${s}=${curr2}&"
+	done
+
+	#Overview_LangSelect
+	args+="Overview_LangSelect=${SERIES_LID}&"
+	args2+="Overview_LangSelect=${SERIES_LID}&"
+
+	#Default Check List
+	local k=
+	local v=
+	for k in Status Genre FirstAired Airs_DayOfWeek Airs_Time Network Runtime Rating IMDB_ID zap2it_id
+	do
+		#Get Config
+		v="$(echo "${CONFIG_JSON}" | jq -e -r .series.${k})"
+		if [ $? -eq 0 ]; then
+			args+="${k}=${v}&"
+		else
+			args+="${k}=$(eval echo "\${SERIES_${k}}")&"
+		fi
+
+		local curr2="$(eval echo "\${SERIES_${k}}")"
+		args2+="${k}=${curr2}&"
+	done
+
+	if [ "${args}" = "${args2}" ]; then
+		echo_yellow " -> " "Already up to date."
+	else
+		echo_yellow " -> " "Update Series."
+
+		echo "${args}" | sed -e 's/^&//g' -e 's/&$//g' > ${DATA_FILE}_Series
+		if [ "${SIMULATION}" = "Y" ]; then
+			echo curl -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" --data-urlencode "id=${SERIES_ID}" -d "function=Save Series" -d "newshowid=${SERIES_ID}" -d @${DATA_FILE}_Series -s "${BASE_URL}/index.php"
+		else
+			curl -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" --data-urlencode "id=${SERIES_ID}" -d "function=Save Series" -d "newshowid=${SERIES_ID}" -d @${DATA_FILE}_Series -s "${BASE_URL}/index.php" > /dev/null
+		fi
+
+		echo_yellow " -> " "Done."
+	fi
+}
+
+fn_get_season_info() {
+	local season="${1}"
+
+	local season_url=
+	for url in ${SEASON_LIST[@]}
+	do
+		if [ "${season}" = "$(echo "${url}" | cut -d ':' -f 1)" ]; then
+			season_url="$(echo "${url}" | cut -d ':' -f 2)"
+			break
+		fi
+	done
+	if [ -z "${season_url}" ]; then
+		echo_red " -> " "Error: Cannot found season(S${season})"
+		exit 1
+	fi
+
+	local seasonid="$(echo "${season_url}" | sed -e 's/.*seasonid=\([0-9]*\).*$/\1/g')"
+	local seasoninfo="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=season" --data-urlencode "seriesid=${SERIES_ID}" --data-urlencode "seasonid=${seasonid}" --data-urlencode "lid=${SERIES_LID}" -s "${BASE_URL}" | iconv -c)"
+	eval SEASON_INFO_${season}="$(echo "\${seasoninfo}")"
+
+	eval EPISODE_LIST_${season}=\(\)
+	while read -r l
+	do
+		episode_url="$(echo "${l}" | sed -e 's/^.*<tr><td class="[^"]*"><a href="\/?\([^"]*\)">\([0-9]*\)<\/a>.*$/\1/g' | sed -e "s/\&amp;/\&/g")"
+		episode_no="$(echo "${l}" | sed -e 's/^.*<tr><td class="[^"]*"><a href="\/?\([^"]*\)">\([0-9]*\)<\/a>.*$/\2/g' | sed -e "s/\&amp;/\&/g")"
+		eval EPISODE_LIST_${season}+=\("$(echo "\${episode_no}:\${episode_url}")"\)
+	done <<< "$(echo "${seasoninfo}" | grep "<tr><td class=\"[^\"]*\"><a href=\"\/?tab=episode&seriesid=.*&seasonid=.*&id=.*.*")"
+
+	#누락된 에피스도 추가
+	local inforefresh=N
+ 	for episode in $(echo "${CONFIG_JSON}" | jq -r ".episodes[] | select(.season==\"${season}\").episode" | sort -u)
+	do
+		if [ -z "$(eval echo "\${EPISODE_LIST_${season}[@]}" | grep "\(^\| \)${episode}:" )" ]; then
+			echo_yellow " -> " "Add new episode (${season} ${episode})"
+			if [ "${SIMULATION}" = "Y" ]; then
+				echo curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "EpisodeNumber=${episode}" -d "EpisodeName=${episode}" -d $"SeriesId=${SERIES_ID}" -d "function=Add Episode" -s "https://www.thetvdb.com/index.php?lid=${SERIES_LID}&seasonid=${seasonid}&seriesid=${SERIES_ID}&tab=season"
+			else
+				curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "EpisodeNumber=${episode}" -d "EpisodeName=${episode}" -d $"SeriesId=${SERIES_ID}" -d "function=Add Episode" -s "https://www.thetvdb.com/index.php?lid=${SERIES_LID}&seasonid=${seasonid}&seriesid=${SERIES_ID}&tab=season" > /dev/null
+			fi
+			inforefresh=Y
+		fi
+	done
+
+	#에피소드 추가시 재조회
+	if [ "${inforefresh}" = "Y" ]; then
+		local seasoninfo="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=season" --data-urlencode "seriesid=${SERIES_ID}" --data-urlencode "seasonid=${seasonid}" --data-urlencode "lid=${SERIES_LID}" -s "${BASE_URL}" | iconv -c)"
+		eval SEASON_INFO_${season}="$(echo "\${seasoninfo}")"
+
+		eval EPISODE_LIST_${season}=\(\)
+		while read -r l
+		do
+			episode_url="$(echo "${l}" | sed -e 's/^.*<tr><td class="[^"]*"><a href="\/?\([^"]*\)">\([0-9]*\)<\/a>.*$/\1/g' | sed -e "s/\&amp;/\&/g")"
+			episode_no="$(echo "${l}" | sed -e 's/^.*<tr><td class="[^"]*"><a href="\/?\([^"]*\)">\([0-9]*\)<\/a>.*$/\2/g' | sed -e "s/\&amp;/\&/g")"
+			eval EPISODE_LIST_${season}+=\("$(echo "\${episode_no}:\${episode_url}")"\)
+		done <<< "$(echo "${seasoninfo}" | grep "<tr><td class=\"[^\"]*\"><a href=\"\/?tab=episode&seriesid=.*&seasonid=.*&id=.*.*")"
+	fi
+}
+
+fn_get_episode_info() {
+	local season=${1}
+	local episode=${2}
+	local episode_url=${3}
+
+	local seasonid="$(echo "${episode_url}" | sed -e 's/^.*seasonid=\([0-9]*\).*$/\1/g')"
+	local episodeid="$(echo "${episode_url}" | sed -e 's/^.*\&id=\([0-9]*\).*$/\1/g')"
+
+	EPISODE_INFO="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=episode" --data-urlencode "seriesid=${SERIES_ID}" --data-urlencode --date-urlencode "seasonid=" --data-urlencode "id=${episodeid}" --data-urlencode "lid=${SERIES_LID}" -s "${BASE_URL}" | iconv -c)"
+
+	#Get Default Config
+	#EpisodeNumber
+	EPISODE_EpisodeNumber="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="EpisodeNumber"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#EpisodeName
+	for s in $(seq 1 1 32)
+	do
+		eval EPISODE_EpisodeName_${s}="$(fn_urlencode "$(echo "${EPISODE_INFO}" | grep "<input type=\"text\".*name=\"EpisodeName_${s}\".*>" | sed -e 's/^.*<input type="text".*name="\(EpisodeName_[0-9]*\)".*value="\(.*\)" style=.*$/\2/g')")"
+	done
+
+	#FirstAired
+	EPISODE_FirstAired="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="FirstAired"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#GuestStars
+	EPISODE_GuestStars="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="GuestStars"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Director
+	EPISODE_Director="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="Director"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Writer
+	EPISODE_Writer="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="Writer"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#ProductionCode
+	EPISODE_ProductionCode="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="ProductionCode"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#Overview
+	for s in $(seq 1 1 32)
+	do
+		local s_row="$(echo "${EPISODE_INFO}" | grep -n "<textarea .*name=\"Overview_${s}\".*>" | cut -f 1 -d ':')"
+		if [ -z "${s_row}" ]; then
+			continue
+		fi
+		local e_row=
+		for r in $(echo "${EPISODE_INFO}" | grep -n "</textarea>" | cut -f 1 -d ':')
+		do
+			if [ "${r}" -ge "${s_row}" ]; then
+				e_row=${r}
+				break
+			fi
+		done
+		local overview="$(echo "${EPISODE_INFO}" | sed -n ${s_row},${e_row}p | sed -e 's/^.*<textarea .*name="Overview_[0-9]*"[^>]*>//g' -e 's/<\/textarea>//g')"
+		local overview_enc="$(fn_urlencode "${overview}")"
+		eval EPISODE_Overview_${s}="\${overview_enc}"
+	done
+
+	#DVD_discid
+	EPISODE_DVD_discid="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="DVD_discid"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#DVD_season
+	EPISODE_DVD_season="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="DVD_season"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#DVD_episodenumber
+	EPISODE_DVD_episodenumber="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="DVD_episodenumber"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#DVD_chapter
+	EPISODE_DVD_chapter="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="DVD_chapter"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#absolute_number
+	EPISODE_absolute_number="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="absolute_number"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	#IDMB_ID
+	EPISODE_IDMB_ID="$(echo "${EPISODE_INFO}" | grep '<input type="text" name="IDMB_ID"' | sed -e 's/^.*value="\([^"]*\)".*$/\1/g')"
+
+	EPISODE_Banner="$(echo "${EPISODE_INFO}" | grep '<a href="banners/episodes/.*\.jpg">.*<img src="/banners/_cache/episodes/.*\.jpg".*$' | sed -e "s@^.*<a href=\"\(banners/episodes/[^\"]\+.jpg\)\">.*<img src=\"/banners/_cache/episodes/.*\.jpg\".*\$@${BASE_URL}/\1@g")"
+
+	if [ "${DEBUG}" = "Y" ]; then
+		local dump_file=dump_${SERIES_ID}_S${season}E${episode}.txt
+		rm -rf "${dump_file}"
+		echo_violet " -> " "Create dump file (${dump_file})"
+		for s in $(seq 1 1 32)
+		do
+			local episodename="$(eval echo "\${EPISODE_EpisodeName_${s}}")"
+			local episodeoverview="$(eval echo "\${EPISODE_Overview_${s}}")"
+
+			if [ ! -z "${episodename}" ]; then
+				echo "EPISODE_EpisodeName_${s} = $(fn_urldecode "${episodename}")" >> ${dump_file}
+			fi
+			if [ ! -z "${episodeoverview}" ]; then
+				echo "EPISODE_Overview_${s} = $(fn_urldecode "${episodeoverview}")" >> ${dump_file}
+			fi
+		done
+		for x in EPISODE_EpisodeNumber EPISODE_FirstAired EPISODE_GuestStars EPISODE_Director EPISODE_Writer EPISODE_ProductionCode EPISODE_DVD_discid EPISODE_DVD_season EPISODE_DVD_episodenumber EPISODE_DVD_chapter EPISODE_absolute_number EPISODE_IDMB_ID
+		do
+			local seriesvalue="$(eval echo "\${${x}}")"
+			if [ ! -z "${seriesvalue}" ]; then
+				echo "${x} = ${seriesvalue}" >> ${dump_file}
+			fi
+		done
+		echo_violet " -> " "Done."
+		read -n 1 -s -r -p "Press any key to continue"
+	fi
+}
+
+fn_update_episode_info() {
+	local season=${1}
+	local episode=${2}
+	local episode_url=${3}
+
+	local seasonid="$(echo "${episode_url}" | sed -e 's/^.*seasonid=\([0-9]*\).*$/\1/g')"
+	local episodeid="$(echo "${episode_url}" | sed -e 's/^.*\&id=\([0-9]*\).*$/\1/g')"
+
+	local args=
+	local args2=
+
+	#EpisodeNumber:1
+	args+="EpisodeNumber=${episode}&"
+	args2+="EpisodeNumber=${episode}&"
+
+	#EpisodeName
+	for s in $(seq 1 1 32)
+	do
+		if [ "${s}" = "${SERIES_LID}" ]; then
+			EpisodeName="$(echo "${CONFIG_JSON}" | jq -e -r ".episodes[] | select(.season==\"${season}\") | select(.episode==\"${episode}\") | .EpisodeName")"
+			if [ $? -eq 0 ]; then
+				EpisodeName="$(fn_urlencode "${EpisodeName}")"
+				args+="EpisodeName_${s}=${EpisodeName}&"
+			else
+				args+="EpisodeName_${s}=$(eval echo \${EPISODE_EpisodeName_${s}})&"
+			fi
+		else
+			args+="EpisodeName_${s}=$(eval echo \${EPISODE_EpisodeName_${s}})&"
+		fi
+
+		local curr2="$(eval echo \${EPISODE_EpisodeName_${s}})"
+		args2+="EpisodeName_${s}=${curr2}&"
+	done
+
+	#EpisodeName_LangSelect
+	args+="EpisodeName_LangSelect=${SERIES_LID}&"
+	args2+="EpisodeName_LangSelect=${SERIES_LID}&"
+
+	#Overview
+	local s=
+	local Overview=
+	for s in $(seq 1 1 32)
+	do
+		if [ "${s}" = "${SERIES_LID}" ]; then
+			Overview="$(echo "${CONFIG_JSON}" | jq -e -r ".episodes[] | select(.season==\"${season}\") | select(.episode==\"${episode}\") | .Overview")"
+			if [ $? -eq 0 ]; then
+				args+="Overview_${s}=$(fn_urlencode "${Overview}")&"
+			else
+				args+="Overview_${s}=$(eval echo \${EPISODE_Overview_${s}})&"
+			fi
+		else
+			args+="Overview_${s}=$(eval echo \${EPISODE_Overview_${s}})&"
+		fi
+
+		local curr2="$(eval echo \${EPISODE_Overview_${s}})"
+		args2+="Overview_${s}=${curr2}&"
+	done
+
+	#Overview_LangSelect
+	args+="Overview_LangSelect=${SERIES_LID}&"
+	args2+="Overview_LangSelect=${SERIES_LID}&"
+
+	#Default Check List
+	local k=
+	local v=
+	for k in FirstAired GuestStars Director Writer ProductionCode DVD_discid DVD_season DVD_episodenumber DVD_chapter absolute_number IMDB_ID
+	do
+		#Get Config
+		v="$(echo "${CONFIG_JSON}" | jq -e -r ".episodes[] | select(.season==\"${season}\") | select(.episode==\"${episode}\") | .${k}")"
+		if [ $? -eq 0 ]; then
+			args+="${k}=${v}&"
+		else
+			args+="${k}=$(eval echo "\${EPISODE_${k}}")&"
+		fi
+
+		local curr2="$(eval echo "\${EPISODE_${k}}")"
+		args2+="${k}=${curr2}&"
+	done
+
+	if [ "${args}" = "${args2}" ]; then
+		echo_yellow " -> " "Already up to date."
+	else
+		echo_yellow " -> " "Update Episode."
+
+		echo "${args}" | sed -e 's/^&//g' -e 's/&$//g' > ${DATA_FILE}_S${season}E${episode}
+		if [ "${SIMULATION}" = "Y" ]; then
+			echo curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" --data-urlencode "tab=episode" --data-urlencode "id=${episodeid}" --data-urlencode "lid=${SERIES_LID}" --data-urlencode "seasonid=${seasonid}" --data-urlencode "seriesid=${SERIES_ID}" -d "function=Save Episode" -d @${DATA_FILE}_S${season}E${episode} -s "${BASE_URL}/index.php"
+		else
+			curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "function=Save Episode" -d @${DATA_FILE}_S${season}E${episode} -s "${BASE_URL}/index.php?tab=episode&id=${episodeid}&lid=${SERIES_LID}&seasonid=${seasonid}&seriesid=${SERIES_ID}"  > /dev/null
+		fi
+	fi
+
+	#이미지
+	image="$(echo "${CONFIG_JSON}" | jq -e -r ".episodes[] | select(.season==\"${season}\") | select(.episode==\"${episode}\") | .image")"
+	if [ $? -eq 0 -a ! -z "${image}" -a -e "${image}" ]; then
+		if [ -z "$(echo "${EPISODE_INFO}" | grep '<img src=".*" class="banner".*>')" ]; then
+			echo_yellow " -> " "Upload episode banner image"
+			if [ "${SIMULATION}" = "Y" ]; then
+				echo curl -s -i -b ${COOKIE_FILE} -X POST -H "Content-Type: multipart/form-data" -F bannerfile=@${image} -F function="Upload Episode Banner" -F button=Upload "https://www.thetvdb.com/?tab=episode&seriesid=${SERIES_ID}&seasonid=${seasonid}&id=${episodeid}&lid=${SERIES_LID}"
+			else
+				curl -s -i -b ${COOKIE_FILE} -X POST -H "Content-Type: multipart/form-data" -F bannerfile=@${image} -F function="Upload Episode Banner" -F button=Upload "https://www.thetvdb.com/?tab=episode&seriesid=${SERIES_ID}&seasonid=${seasonid}&id=${episodeid}&lid=${SERIES_LID}" > /dev/null
+			fi
+			echo_yellow " -> " "Done."
+		fi
+	fi
+}
+
+while [ ${#} -ne 0 ]
+do
+	case "${1}" in
+		-f) CONFIG_FILE="${2}" ; shift 1 ;;
+		-u) SIMULATION=N ;;
+		-d) DEBUG=Y ;;
+	esac
+
+	shift 1
+done
+
+#Read Config
+if [ -z "${CONFIG_FILE}" -a -e "${DEFAULT_CONFIG_FILE}" ]; then
+	CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
+fi
+if [ -z "${CONFIG_FILE}" ]; then
+	fn_usage
+	exit 1
+fi
+
+#json parsing
+CONFIG_JSON="$(jq -e . "${CONFIG_FILE}" 2> /dev/null)"
+if [ $? -ne 0 -o -z "${CONFIG_JSON}" ]; then
+	fn_usage
+	exit 1
+fi
+SERIES_ID="$(echo "${CONFIG_JSON}" | jq -r .series.id)"
+if [ $? -ne 0 -o -z "${SERIES_ID}" ]; then
+	echo_red " -> " "Error: invalid from series id"
+	exit 1
+fi
+SERIES_LID="$(echo "${CONFIG_JSON}" | jq -r .series.lid)"
+if [ -z "${SERIES_ID}" -o -z "${SERIES_LID}" ]; then
+	echo_red " -> " "Error: invalid json"
+	exit 1
+fi
+DATA_FILE=datafile_${SERIES_ID}
+
+#login
+echo_blue " -> " "Start - Login"
+if [ -z "${USERNAME}" ]; then
+	echo -n "Login ID : "
+	read -r USERNME
+fi
+if [ -z "${PASSWORD}" ]; then
+	echo -n "Login PW : "
+	read -r PASSWORD
+fi
+fn_login
+echo_blue " -> " "Done."
+echo
+
+#시리즈 정보 조회
+SERIES_INFO="$(curl --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --data-urlencode "tab=series" --data-urlencode "id=${SERIES_ID}" --data-urlencode "lid=${SERIES_LID}" -s "${BASE_URL}" | iconv -c)"
+if [ -z "${SERIES_INFO}" ]; then
+	echo_red " -> " "Error: Cannot get series info"
+	exit 1
+fi
+
+#Confirm
+#SeriesName
+eval SeriesName="$(fn_urlencode "$(echo "${SERIES_INFO}" | grep "<input type=\"text\".*name=\"SeriesName_${SERIES_LID}\".*>" | sed -e 's/^.*<input type="text".*name="\(SeriesName_[0-9]*\)".*value="\(.*\)" style=.*$/\2/g')")"
+echo_green " -> Simulation Mode : ${SIMULATION}"
+echo_green " -> Series Name : $(fn_urldecode "${SeriesName}")"
+#read -n 1 -s -r -p "Press any key to continue"
+read -p "Press enter to continue"
+echo
+
+#시리즈 정보 조회
+echo_blue " -> " "Start - Get Series Info"
+fn_get_series_info
+echo_blue " -> " "Done."
+echo
+
+#시리즈 정보 업데이트
+echo_blue " -> " "Start - Update Series Info"
+fn_update_series_info
+echo_blue " -> " "Done."
+echo
+
+#시즌
+for season in $(echo "${CONFIG_JSON}" | jq -r ".episodes[].season" | sort -u)
+do
+	#시즌 정보 조회
+	echo_blue " -> " "Start - Get Season Info (S${season})"
+	fn_get_season_info ${season}
+	echo_blue " -> " "Done."
+	echo
+
+	##시즌 정보 업데이트
+	#echo_blue " -> " "Start - Update Season Info (S${season})"
+	#fn_update_season_info ${season}
+	#echo_blue " -> " "Done."
+	#echo
+
+
+ 	for episode in $(echo "${CONFIG_JSON}" | jq -r ".episodes[] | select(.season==\"${season}\").episode" | sort -u)
+	do
+		episode_url=
+		for episode_url_tmp in $(eval echo \${EPISODE_LIST_${season}[@]})
+		do
+			if [ "${episode}" = "$(echo "${episode_url_tmp}" | cut -d ':' -f 1)" ]; then
+				episode_url="$(echo "${episode_url_tmp}" | cut -d ':' -f 2)"
+				break
+			fi
+		done
+
+		if [ -z "${episode}" ]; then
+			continue
+		fi
+		if [ -z "${episode_url}" ]; then
+			continue
+		fi
+
+		echo_blue " -> " "Start - Get Episode Info (S${season}E${episode})"
+		fn_get_episode_info  "${season}" "${episode}" "${episode_url}"
+		echo_blue " -> " "Done."
+		echo
+
+		echo_blue " -> " "Start - Update Episode Info (S${season}E${episode})"
+		fn_update_episode_info "${season}" "${episode}" "${episode_url}"
+		echo_blue " -> " "Done."
+		echo
+	done
+done
+

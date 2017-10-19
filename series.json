@@ -1,0 +1,42 @@
+{
+	"series": {
+		"id_org": "9999",
+		"id": "9998",
+		"lid": "32"
+	},
+	"episodes": [
+	],
+	"_series_params": {
+		"id": "",
+		"lid": "",
+		"SeriesName": "",
+		"Overview": "",
+		"Status": "",
+		"Genre": "",
+		"FirstAired": "",
+		"Airs_DayOfWeek": "",
+		"Airs_Timea": "",
+		"Network": "",
+		"Runtime": "",
+		"Rating": "",
+		"IMDB_ID": "",
+		"zap2it_id": ""
+	},
+	"_episode_params": {
+		"EpisodeName": "",
+		"Overview": "",
+		"FirstAired": "",
+		"GuestStars": "",
+		"Director": "",
+		"Writer": "",
+		"ProductionCode": "",
+		"DVD_discid": "",
+		"DVD_season": "",
+		"DVD_episodenumber": "",
+		"DVD_chapter": "",
+		"absolute_number": "",
+		"IMDB_ID": ""
+	}
+}
+
+
