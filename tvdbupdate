@@ -276,11 +276,11 @@ fn_get_series_info() {
 		do
 			y="$(echo "${line}" | sed -e 's/^\([^:]\+\):.*$/\1/g')"
 			if [ "${y}" -ge "${x}" ]; then
-				actor_role="$(echo "${SERIES_ACTOR_INFO_ORG}" | sed -n ${y},$((y + 3))p | grep '<input type="input" name="Role"' | sed -e 's/^.*<input.*value="\([^"]\+\)".*$/\1/g')"
+				actor_role="$(echo "${SERIES_ACTOR_INFO}" | sed -n ${y},$((y + 3))p | grep '<input type="input" name="Role"' | sed -e 's/^.*<input.*value="\([^"]\+\)".*$/\1/g')"
 				
 				break
 			fi
-		done <<< "$(echo "${SERIES_ACTOR_INFO_ORG}" | grep -a -n '<td>Role:</td>')"
+		done <<< "$(echo "${SERIES_ACTOR_INFO}" | grep -a -n '<td>Role:</td>')"
 
 		while read -r line
 		do
@@ -439,7 +439,7 @@ fn_get_season_info() {
  	for episode in $(echo "${CONFIG_JSON}" | jq -r ".episodes[] | select(.season==\"${season}\").episode" | sort -u)
 	do
 		if [ -z "$(eval echo "\${EPISODE_LIST_${season}[@]}" | grep "\(^\| \)${episode}:" )" ]; then
-			echo_yellow " -> " "Add new episode (${season} ${episode})"
+			echo_yellow " -> " "Add new episode (S${season}E${episode})"
 			if [ "${SIMULATION}" = "Y" ]; then
 				echo curl -s -X POST -b ${COOKIE_FILE} --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8' --header "Accept-Language: ko-KR,ko;q=0.8,en-US;q=0.6,en;q=0.4" --header "Content-Type: application/x-www-form-urlencoded" --header "upgrade-insecure-requests: 1" -d "EpisodeNumber=${episode}" -d "EpisodeName=${episode}" -d $"SeriesId=${SERIES_ID}" -d "function=Add Episode" -s "https://www.thetvdb.com/index.php?lid=${SERIES_LID}&seasonid=${seasonid}&seriesid=${SERIES_ID}&tab=season"
 			else
